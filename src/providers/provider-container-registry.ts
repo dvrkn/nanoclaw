@@ -7,7 +7,7 @@
  * the registered config fn, and merges the returned mounts/env into the spawn
  * args.
  *
- * Providers without host-side needs (e.g. `claude`, `mock`) don't appear in
+ * Providers without host-side needs (e.g. `claude`) don't appear in
  * this registry at all — the lookup returns `undefined` and the spawn path
  * proceeds with only the default mounts and env.
  *
@@ -62,8 +62,8 @@ export interface ProviderHostCapabilities {
    * composed project doc, skill-discovery links, and provider state dir —
    * and the host must NOT compose or mount the default ones (composed
    * CLAUDE.md, `.claude-fragments`, `/app/CLAUDE.md`, `/home/node/.claude`,
-   * `CLAUDE.local.md` seeding). The provider's config fn does its own
-   * composing and returns its own mounts. Default off — providers that omit
+   * project document). The provider's config fn does its own composing and
+   * returns its own mounts. Default off — providers that omit
    * this get the default surfaces, which is today's behavior.
    */
   readonly providesAgentSurfaces?: boolean;

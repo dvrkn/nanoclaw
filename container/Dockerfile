@@ -123,9 +123,32 @@ RUN mkdir -p /workspace/group /workspace/extra && \
     chown -R node:node /workspace && \
     chmod 777 /home/node
 
+# Drop setuid-root from the binaries Debian ships (mount, su, passwd, ...). The
+# agent runs unprivileged and needs none of them.
+RUN find / -xdev -perm -4000 -type f -exec chmod u-s {} + || true
+
 USER node
 WORKDIR /workspace/group
 
-# tini is PID 1, reaps zombies, forwards signals cleanly. entrypoint.sh does
-# `exec bun ...` so bun runs as tini's direct child.
+# Only applies to a bare `docker run` — the host spawn overrides ENTRYPOINT and
+# passes --init instead (see hardeningArgs in src/container-runner.ts).
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
+
+# ---- Provenance labels -------------------------------------------------------
+# LAST on purpose. An ARG invalidates every layer below it, so declaring these
+# up with the other build-args would make an otherwise-cached rebuild redo
+# `bun install` and the pnpm global CLIs on every existing install, for two
+# pieces of metadata. Labels have no filesystem effect, so they cost nothing here.
+#
+# Which lockfile the baked /app/node_modules came from: /app/src is mounted from
+# the host checkout at every spawn, so an image and a checkout whose lockfiles
+# disagree fail as a missing module inside a `--rm` container with no logs.
+# container/pull.sh checks this before retagging. build.sh passes it; a bare
+# `docker build` leaves it empty, which the pull path treats as unverifiable.
+#
+# image-source defaults to `local` so anything built from this file is honest
+# unless its builder says otherwise — the retag cannot forge it after the fact.
+ARG AGENT_RUNNER_LOCK_SHA256=
+LABEL dev.nanoclaw.agent-runner-lock-sha256="${AGENT_RUNNER_LOCK_SHA256}"
+ARG IMAGE_SOURCE=local
+LABEL dev.nanoclaw.image-source="${IMAGE_SOURCE}"
