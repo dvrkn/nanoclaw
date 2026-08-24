@@ -16,6 +16,7 @@ export function createCommandRunner(): CommandRunner {
       cwd,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 256 * 1024 * 1024,
     }).trim();
   return {
     run,
