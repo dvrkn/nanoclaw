@@ -212,6 +212,23 @@ describe('command classification', () => {
     const real = messages.find((m) => m.id === 'm1')!;
     expect(isClearCommand(real)).toBe(true);
   });
+
+  it('an ambient trigger=0 slash command (another bot\'s /ban) is never a runner command', () => {
+    insertMessage('m1', 'chat-sdk', { sender: 'Alice', text: '/ban' }, { seq: 2, trigger: 0, channelType: 'telegram' });
+    insertMessage('m2', 'chat-sdk', { sender: 'Bob', text: 'hello nanoclaw' }, { seq: 4, trigger: 1, channelType: 'telegram' });
+
+    const messages = getPendingMessages();
+    expect(messages.some((m) => isRunnerCommand(m))).toBe(false);
+    const ambient = messages.find((m) => m.id === 'm1')!;
+    expect(categorizeMessage(ambient).category).toBe('none');
+  });
+
+  it('an ambient trigger=0 /clear never resets the session', () => {
+    insertMessage('m1', 'chat-sdk', { sender: 'Alice', text: '/clear' }, { seq: 2, trigger: 0, channelType: 'telegram' });
+
+    const [ambient] = getPendingMessages();
+    expect(isClearCommand(ambient)).toBe(false);
+  });
 });
 
 describe('accumulate gate regression', () => {

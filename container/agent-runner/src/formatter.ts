@@ -50,8 +50,11 @@ export function categorizeMessage(msg: MessageInRow): CommandInfo {
   const senderId = extractSenderId(msg, content);
 
   // Cross-session echo rows are ambient copies of another conversation —
-  // a copied "/clear" etc. must never execute here.
-  if (isSessionEcho(msg) || !text.startsWith('/')) {
+  // a copied "/clear" etc. must never execute here. Same for trigger=0
+  // context rows: group chatter that never engaged the agent, e.g. a "/ban"
+  // aimed at some other bot in the group. Classifying those as commands made
+  // the follow-up poller abort every active stream while they sat pending.
+  if (isSessionEcho(msg) || msg.trigger === 0 || !text.startsWith('/')) {
     return { category: 'none', command: '', text, senderId };
   }
 
@@ -75,7 +78,8 @@ export function categorizeMessage(msg: MessageInRow): CommandInfo {
  * before messages reach the container.
  */
 export function isClearCommand(msg: MessageInRow): boolean {
-  if (isSessionEcho(msg)) return false;
+  // Echo and trigger=0 context rows never execute — see categorizeMessage.
+  if (isSessionEcho(msg) || msg.trigger === 0) return false;
   const content = parseContent(msg.content);
   const text = (content.text || '').trim();
   return text.toLowerCase().startsWith('/clear');
