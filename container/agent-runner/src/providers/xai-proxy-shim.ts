@@ -173,6 +173,20 @@ function flattenFunctionOutput(output: unknown): unknown {
   return parts.length ? '(see attached media)' : '';
 }
 
+/**
+ * Codex serializes every replayed `reasoning` item with `content: null`; xAI
+ * fails to decode the item ("Could not decode the compaction blob") when that
+ * key is present, and likewise when `summary` is absent. Both are Codex
+ * serialization artifacts, not part of the encrypted blob — the blob itself is
+ * passed through byte-for-byte.
+ */
+function normalizeReasoningItem(item: Json): Json {
+  const next: Json = { ...item };
+  if (next.content === null) delete next.content;
+  if (!Array.isArray(next.summary)) next.summary = [];
+  return next;
+}
+
 /** Apply the known xAI request normalizations (pure). */
 export function sanitizeXaiRequestBody(body: unknown, rejected: ReadonlySet<string> = learnedRejections): unknown {
   if (!isRecord(body)) return body;
@@ -180,11 +194,12 @@ export function sanitizeXaiRequestBody(body: unknown, rejected: ReadonlySet<stri
   for (const name of new Set([...XAI_UNSUPPORTED_ARGUMENTS, ...rejected])) next = deleteArgument(next, name);
   if (!isRecord(next)) return next;
   if (Array.isArray(next.input)) {
-    next.input = next.input.map((item) =>
-      isRecord(item) && item.type === 'function_call_output'
-        ? { ...item, output: flattenFunctionOutput(item.output) }
-        : item,
-    );
+    next.input = next.input.map((item) => {
+      if (!isRecord(item)) return item;
+      if (item.type === 'function_call_output') return { ...item, output: flattenFunctionOutput(item.output) };
+      if (item.type === 'reasoning') return normalizeReasoningItem(item);
+      return item;
+    });
   }
   return next;
 }
