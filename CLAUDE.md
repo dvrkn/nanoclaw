@@ -124,7 +124,7 @@ Key files: `src/cli/dispatch.ts` (dispatcher + approval handler), `src/cli/crud.
 Trunk does not ship any specific channel adapter or non-default agent provider. The codebase is the registry/infra; the actual adapters and providers live on long-lived sibling branches and get copied in by skills:
 
 - **`channels` branch** — Discord, Slack, Telegram, WhatsApp, Teams, Linear, GitHub, iMessage, Webex, Resend, Matrix, Google Chat, WhatsApp Cloud, Signal, WeChat, DeltaChat, Emacs (+ helpers, tests, channel-specific setup steps). Installed via `/add-<channel>` skills.
-- **`providers` branch** — OpenCode (and any future non-default agent providers). Installed via `/add-opencode`.
+- **`providers` branch** — OpenCode, Codex, xAI/Grok (and any future non-default agent providers). Installed via `/add-opencode`, `/add-codex`, `/add-xai`. The `xai` provider composes the Codex payload (both xAI backends speak the OpenAI Responses API); its sign-in is xAI's OAuth device-code flow (SuperGrok subscription) or an xAI API key, vault-only, with the host refreshing the OAuth access token and rotating the vault copy (`src/providers/xai-oauth-refresh.ts`; refresh token host-only in `data/xai-oauth.json`).
 
 Each `/add-<name>` skill is idempotent: `git fetch origin <branch>` → copy module(s) into the standard paths → append a self-registration import to the relevant barrel → `pnpm install <pkg>@<pinned-version>` → build. Channel skills carry these steps as `nc:` directive fences: setup applies them via the engine (`scripts/skill-apply.ts`), an agent applies the prose — same install either way. See [docs/skill-directives.md](docs/skill-directives.md).
 
