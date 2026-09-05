@@ -40,6 +40,8 @@ rm -f src/providers/xai.ts \
       src/providers/xai-oauth.test.ts \
       src/providers/xai-oauth-refresh.test.ts \
       container/agent-runner/src/providers/xai.ts \
+      container/agent-runner/src/providers/xai-proxy-shim.ts \
+      container/agent-runner/src/providers/xai-proxy-shim.test.ts \
       container/agent-runner/src/providers/xai-registration.test.ts \
       container/agent-runner/src/providers/xai.config.test.ts \
       setup/providers/xai.ts \

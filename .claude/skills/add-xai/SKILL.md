@@ -7,7 +7,7 @@ description: Use xAI's Grok as a full agent provider — sign in with a SuperGro
 
 > Shortcut: `pnpm exec tsx setup/index.ts --step provider-auth xai` performs this whole install (the Codex payload it runs on, then the xai payload: files, barrels, image rebuild) plus the sign-in in one command. The steps below are the same operations, for agent-driven or manual application.
 
-NanoClaw selects each group's agent backend from `container_configs.provider` (default `claude`). This skill installs the `xai` provider: Grok on the Codex app-server runtime. Both xAI backends — the Grok CLI proxy a SuperGrok subscription unlocks (`cli-chat-proxy.grok.com`) and the pay-per-use API (`api.x.ai`) — speak the OpenAI Responses API, which is the Codex app-server's native wire protocol. So `xai` composes the Codex payload rather than shipping a second agent loop: same turn loop, MCP tools, server-side history, memory hook and conversation archive; the one difference is a `[model_providers.xai]` block spliced into Codex's `config.toml` before every spawn (backend URL, Responses wire API, a placeholder bearer, and — proxy only — the Grok CLI identity headers the proxy requires).
+NanoClaw selects each group's agent backend from `container_configs.provider` (default `claude`). This skill installs the `xai` provider: Grok on the Codex app-server runtime. Both xAI backends — the Grok CLI proxy a SuperGrok subscription unlocks (`cli-chat-proxy.grok.com`) and the pay-per-use API (`api.x.ai`) — speak the OpenAI Responses API, which is the Codex app-server's native wire protocol. So `xai` composes the Codex payload rather than shipping a second agent loop: same turn loop, MCP tools, server-side history, memory hook and conversation archive; the differences are a `[model_providers.xai]` block spliced into Codex's `config.toml` before every spawn (Responses wire API, a placeholder bearer) and a localhost request shim that block points at. Codex wraps MCP tools in Responses `namespace` tools, which xAI rejects (HTTP 422 `unknown variant namespace`) and Codex cannot turn off; the shim flattens them to plain functions on the way out, restores `name` + `namespace` on the model's tool calls on the way back, and adds the Grok CLI identity headers the proxy requires. It runs inside the agent-runner process and forwards through the container's OneCLI proxy, so the vault still injects the token.
 
 Credentials are **vault-only**: the Grok access token (OAuth) or the xAI API key lives in the OneCLI vault as an `Authorization: Bearer` rewrite keyed to the backend host, and the container only ever carries a `placeholder` bearer. The OAuth *refresh* token is host-only — `data/xai-oauth.json`, mode 0600, never mounted, removed by uninstall. The host refreshes the access token ten minutes before it expires and rotates the vault copy; running containers pick the new token up on their next request. Nothing secret lands in `.env`.
 
@@ -28,7 +28,7 @@ test -f src/providers/codex.ts && test -f container/agent-runner/src/providers/c
 Check whether the xai payload is already wired (a prior apply, or a trunk that still carries it). All of these present means installed — skip to **Authenticate**:
 
 - `src/providers/xai.ts`, `src/providers/xai-oauth.ts`, `src/providers/xai-oauth-refresh.ts` and `src/providers/xai-vault.ts`
-- `container/agent-runner/src/providers/xai.ts`
+- `container/agent-runner/src/providers/xai.ts` and `container/agent-runner/src/providers/xai-proxy-shim.ts`
 - `setup/providers/xai.ts`
 - `import './xai.js';` in `src/providers/index.ts`, `container/agent-runner/src/providers/index.ts`, and `setup/providers/index.ts`
 
@@ -47,8 +47,10 @@ src/providers/xai-oauth.test.ts
 src/providers/xai-oauth-refresh.test.ts
 src/providers/xai-vault.test.ts
 container/agent-runner/src/providers/xai.ts
+container/agent-runner/src/providers/xai-proxy-shim.ts
 container/agent-runner/src/providers/xai-registration.test.ts
 container/agent-runner/src/providers/xai.config.test.ts
+container/agent-runner/src/providers/xai-proxy-shim.test.ts
 setup/providers/xai.ts
 setup/providers/xai.test.ts
 setup/providers/xai-registration.test.ts
@@ -149,6 +151,7 @@ Env the host passes into xai containers (all non-secret, read from `.env` at spa
 ## Troubleshooting
 
 - **Container dies at boot, channel silent:** `grep 'Container exited non-zero' logs/nanoclaw.error.log` — the `stderrTail` carries the reason. `Unknown provider: xai. Registered: claude, codex` means the container barrel isn't wired in the running build; `Unknown provider: codex` (or an import error naming `codex-app-server`) means the Codex payload under xai is missing — apply `/add-codex`'s Install section.
+- **`422 Unprocessable Entity … tools[N].type: unknown variant namespace` from `cli-chat-proxy.grok.com`:** Codex reached xAI directly instead of through the shim — the group's container runs an agent-runner without `container/agent-runner/src/providers/xai-proxy-shim.ts`, or its `~/.codex/config.toml` has an `https://` base URL under `[model_providers.xai]`. Update the payload and restart the group; a healthy config points Codex at `http://127.0.0.1:<port>/v1`.
 - **In-channel `Error: spawn codex ENOENT` on every message:** the image predates the `@openai/codex` manifest entry — re-run `./container/build.sh`.
 - **401 / "auth" errors mid-conversation:** the vault has no xAI secret, or its token is stale. `onecli secrets list` should show `xAI`; if the agent is in `selective` secret mode, grant it (`onecli agents grants attach-secret`, or the web UI at `http://127.0.0.1:10254`). For OAuth, check `logs/nanoclaw.error.log` for `xAI OAuth session is dead` and re-run `pnpm exec tsx setup/index.ts --step provider-auth xai` — it updates the existing secret in place.
 - **`Couldn't complete the Grok sign-in: xAI device code expired`:** the one-time code is valid for a few minutes — re-run and approve promptly. Over SSH nothing opens automatically; copy the URL into any browser.
