@@ -455,9 +455,9 @@ This is documented as a pattern, not a built-in feature.
     ... working files
 ```
 
-Two directory mounts: session folder at `/workspace`, agent group folder at `/workspace/agent/`. The agent-runner CDs into `/workspace/agent/` to run the agent. Claude SDK writes `.claude/` at `/workspace/.claude/` (root of the workspace).
+Two directory mounts: session folder at `/workspace`, agent group folder at `/workspace/agent/`, plus nested read-only file mounts over the group dir (the composed `CLAUDE.md`, `container.json`). The agent-runner CDs into `/workspace/agent/` to run the agent. Claude SDK writes `.claude/` at `/workspace/.claude/` (root of the workspace).
 
-The runtime is Docker (`src/container-runtime.ts` hardcodes the `docker` binary); nested bind mounts make this layout straightforward. The layout deliberately sticks to directory mounts (no file-level mounts) so it stays portable to runtimes that only support directory mounts.
+The runtime is Docker (`src/container-runtime.ts` hardcodes the `docker` binary); nested bind mounts make this layout straightforward. Directory mounts carry the bulk of the layout, so it stays close to portable for runtimes with weaker file-mount support; the nested file mounts exist to make individual files read-only on top of a read-write dir.
 
 **Cross-mount DB access:** The two files exist precisely so each has a single writer — the
 host writes `inbound.db`, the container writes `outbound.db` — which removes writer
@@ -921,7 +921,7 @@ See [agent-runner-details.md](agent-runner-details.md) for full MCP tool paramet
 
 ### Cards
 
-**Agent-initiated (outbound):** Tool-based. Agent calls `ask_user_question` (interactive card with options) or `send_card` (structured card). Agent-runner writes the card structure to messages_out. Host/adapter handles platform-specific rendering (Slack Block Kit, Discord embeds, Telegram inline keyboard, text fallback).
+**Agent-initiated (outbound):** Tool-based. Agent calls `ask_user_question` for an interactive card with callback options, or `send_card` for a display card with optional URL link buttons. Agent-runner writes the card structure to messages_out. The host/adapter handles platform-specific rendering. `send_card` does not support callback buttons or nested action blocks; each top-level link action requires a non-empty label and a web (http or https) URL. Use `ask_user_question` when a selection must return to the agent.
 
 **Host-initiated (approval cards):** When an action requires approval, the host generates a standardized approval card and sends it to the admin's DM. These are not agent-initiated — the agent doesn't know about the approval step. The card format is fixed (action description + approve/deny buttons).
 

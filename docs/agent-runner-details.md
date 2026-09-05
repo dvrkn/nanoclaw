@@ -558,19 +558,39 @@ Implementation:
 
 #### send_card
 
-Send a structured card (interactive or display-only).
+Send a display card and continue without waiting for a response. `send_card`
+supports display content and URL link buttons only; use `ask_user_question` for
+callback buttons and choices.
 
 ```typescript
 {
   name: 'send_card',
   params: {
-    card: CardElement,     // card structure (title, children, actions)
-    fallbackText?: string, // text fallback for platforms without card support
+    card: {                // title/description, text children, URL link actions
+      title?: string,
+      description?: string,
+      children?: (string | { text: string })[],
+      actions?: { label: string; url: string; style?: string }[], // 'primary' | 'danger' | 'default'; anything else renders as default
+    },
+    fallbackText?: string, // plain-text rendering of the card, unrelated to buttons
   }
 }
 ```
 
-Implementation: write a `messages_out` row with `kind: 'chat-sdk'` and the card structure in content.
+Implementation: write a `messages_out` row with `kind: 'chat-sdk'` and the card
+structure in content. One schema — `LINK_ACTION_SCHEMA` in
+`container/agent-runner/src/mcp-tools/interactive.ts` — is both advertised in
+the tool's `inputSchema` and compiled once as the validator the handler runs, so
+invalid actions are filtered out before the row is written and the reported
+dropped count matches what was stored. Every link action needs a non-empty
+`label` and a `url` that is a web link — `http://` or `https://`, with a host.
+Those are the only schemes every adapter can render as a button, and the agent
+does not pick the channel, so the tool promises no more than that: `#`,
+`mailto:` and the rest are dropped and the agent is pointed at
+`ask_user_question`. The bridge does not re-apply that rule. It drops an action
+only when `label` or `url` is not a non-empty string. Any producer can write
+this payload. Nested action blocks and callback actions are not supported by
+this tool.
 
 #### ask_user_question
 
@@ -762,7 +782,7 @@ The agent-runner receives configuration via:
 
 - **`container.json`:** The provider name, model, assistant name, MCP servers, and other NanoClaw config are read from `/workspace/agent/container.json` (materialized by the host from the `container_configs` table), not from environment variables. See `container/agent-runner/src/config.ts`.
 - **Environment variables:** provider-specific vars only (API keys, model overrides), `TZ`.
-- **Fixed mount paths:** Host-written `inbound.db` (read-only) at `/workspace/inbound.db` and container-owned `outbound.db` at `/workspace/outbound.db`. Agent group folder at `/workspace/agent/`. System prompt from `/workspace/agent/CLAUDE.md` and `/workspace/global/CLAUDE.md`.
+- **Fixed mount paths:** Host-written `inbound.db` (read-only) at `/workspace/inbound.db` and container-owned `outbound.db` at `/workspace/outbound.db`. Agent group folder at `/workspace/agent/`. The project document is a single composed file at `/workspace/agent/CLAUDE.md`.
 
 The agent-runner reads config, creates the provider, and enters the poll loop. No stdin, no initial prompt — messages are already in the session DB.
 
@@ -787,7 +807,7 @@ The provider name comes from the `provider` key in `/workspace/agent/container.j
 
 - MCP servers are local processes or remote Streamable HTTP endpoints managed by the provider via `mcpServers`
 - The MCP server binary is shared across providers — same tools, same DB access
-- CLAUDE.md loading (global + per-group) — agent-runner reads and passes as `systemPrompt`
+- Project-document loading — the host composes `/workspace/agent/CLAUDE.md` and Claude Code loads it via the `project` setting source; the agent-runner contributes only the runtime addendum from `buildSystemPromptAddendum`
 - Additional directories discovery (`/workspace/extra/*`)
 - Logging via stderr (`[agent-runner] ...`)
 
