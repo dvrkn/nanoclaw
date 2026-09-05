@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 // Keep the auth flow's structured logging out of logs/setup.log.
 vi.mock('../logs.js', () => ({ step: vi.fn(), userInput: vi.fn() }));
 
-import { findXaiSecret, runXaiDeviceCodeLogin, verifyXaiInstall } from './xai.js';
+import { findForeignXaiSecrets, findXaiSecret, runXaiDeviceCodeLogin, verifyXaiInstall } from './xai.js';
 import { XAI_OAUTH_DISCOVERY_URL } from '../../src/providers/xai-oauth.js';
 
 // Structural guard for the xai payload wiring: provider files, the three
@@ -17,16 +17,27 @@ describe('verifyXaiInstall', () => {
   });
 });
 
-describe('findXaiSecret', () => {
-  it('matches the vault entry by name or by the backend host it rewrites for', () => {
-    const byName = { id: '1', name: 'xAI', type: 'generic', hostPattern: null };
-    const byProxyHost = { id: '2', name: 'whatever', type: 'generic', hostPattern: 'cli-chat-proxy.grok.com' };
-    const byApiHost = { id: '3', name: 'keys', type: 'generic', hostPattern: 'api.x.ai' };
-    const other = { id: '4', name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com' };
-    expect(findXaiSecret([other, byName])).toBe(byName);
-    expect(findXaiSecret([other, byProxyHost])).toBe(byProxyHost);
-    expect(findXaiSecret([other, byApiHost])).toBe(byApiHost);
+// Regression: an operator's own `XAI_API_KEY` secret for api.x.ai was once
+// matched by host and overwritten with the OAuth token. Only OUR name counts;
+// foreign xAI-host secrets are surfaced, never reused.
+describe('findXaiSecret / findForeignXaiSecrets', () => {
+  const ours = { id: '1', name: 'xAI', type: 'generic', hostPattern: 'cli-chat-proxy.grok.com' };
+  const operatorApiKey = { id: '3', name: 'XAI_API_KEY', type: 'generic', hostPattern: 'api.x.ai' };
+  const operatorProxy = { id: '2', name: 'whatever', type: 'generic', hostPattern: 'cli-chat-proxy.grok.com' };
+  const other = { id: '4', name: 'Anthropic', type: 'anthropic', hostPattern: 'api.anthropic.com' };
+
+  it('reuses only the secret this walk-through named', () => {
+    expect(findXaiSecret([other, operatorApiKey, ours])).toBe(ours);
+    expect(findXaiSecret([other, operatorApiKey, operatorProxy])).toBeUndefined();
     expect(findXaiSecret([other])).toBeUndefined();
+  });
+
+  it('reports operator-owned secrets on xAI hosts without touching them', () => {
+    expect(findForeignXaiSecrets([other, operatorApiKey, operatorProxy, ours])).toEqual([
+      operatorApiKey,
+      operatorProxy,
+    ]);
+    expect(findForeignXaiSecrets([other, ours])).toEqual([]);
   });
 });
 

@@ -155,6 +155,7 @@ Env the host passes into xai containers (all non-secret, read from `.env` at spa
 - **`xAI returned an HTML/Cloudflare challenge`:** xAI is challenging the automated refresh. The refresher retries on its own; if it persists, re-run the sign-in.
 - **Model errors from the proxy (`model not found`, `x-grok-model-override`):** with OAuth the model must be one the subscription lists. Re-run the sign-in to see the catalog, then `ncl groups config update --id <group-id> --model <id>` and restart the group.
 - **Requests going to the wrong backend:** `XAI_BASE_URL` in `.env` must match the credential — `https://cli-chat-proxy.grok.com/v1` for OAuth, `https://api.x.ai/v1` for an API key. The sign-in writes it; switching methods rewrites it.
+- **You already had an xAI secret in the vault** (e.g. `XAI_API_KEY` migrated from `.env`): the sign-in never reuses or overwrites it — it creates its own entry named `xAI` and warns when both rewrite the same host, since two secrets on one host is ambiguous. Delete the one you no longer need with `onecli secrets delete --id <id>`.
 - **Sign-in "already connected" but you want a different account:** `onecli secrets delete --id <id>` for the `xAI` entry, `rm data/xai-oauth.json`, then re-run the sign-in.
 
 To remove this provider, see [REMOVE.md](REMOVE.md).
