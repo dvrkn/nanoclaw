@@ -21,7 +21,11 @@
  *   4. restores `name` + `namespace` on every `function_call` item in the
  *      reply, streamed (SSE) or not, so Codex routes the call to its handler.
  *
- * Everything else passes through untouched. The shim binds 127.0.0.1 on an
+ * xAI also implements a narrower Responses request surface than OpenAI. Known
+ * gaps are normalized up front (`sanitizeXaiRequestBody`); for the rest the
+ * shim reads xAI's own `Argument not supported: <name>` 400 and retries with
+ * that argument removed, remembering the name so later requests skip the
+ * round trip. Everything else passes through untouched. The shim binds 127.0.0.1 on an
  * ephemeral port and lives inside the agent-runner process.
  */
 import fs from 'fs';
@@ -30,6 +34,8 @@ export const XAI_GROK_OAUTH_HOST = 'cli-chat-proxy.grok.com';
 export const XAI_GROK_CLIENT_VERSION = '1.0.4';
 /** Separator between namespace and tool in a flattened function name (Codex's own legacy style). */
 export const XAI_FLAT_SEPARATOR = '__';
+/** Cap on "drop the named argument and retry" rounds per request. */
+const MAX_ARGUMENT_RETRIES = 6;
 
 type Json = Record<string, unknown>;
 
@@ -97,6 +103,85 @@ export function flattenRequestBody(body: unknown): { body: unknown; names: FlatN
   }
 
   return { body: next, names };
+}
+
+// ─── request side: xAI compatibility ─────────────────────────────────────
+
+/**
+ * OpenAI-only request arguments xAI's Responses API is known to refuse; each
+ * would otherwise cost a `400 Argument not supported` round trip. Learned
+ * names from live rejections are added at runtime (see `rememberRejectedArgument`).
+ */
+export const XAI_UNSUPPORTED_ARGUMENTS = new Set<string>([
+  'prompt_cache_key',
+  'prompt_cache_retention',
+  'safety_identifier',
+  'service_tier',
+  // Codex's hosted web_search carries OpenAI's access-scope knobs; xAI's
+  // web_search takes the bare type.
+  'external_web_access',
+  'indexed_web_access',
+  // `text.verbosity` is an OpenAI verbosity control.
+  'verbosity',
+]);
+
+const learnedRejections = new Set<string>();
+
+export function rememberRejectedArgument(name: string): void {
+  learnedRejections.add(name);
+}
+
+/** Test seam. */
+export function _resetLearnedRejectionsForTesting(): void {
+  learnedRejections.clear();
+}
+
+/** Remove a key by name anywhere in the request: top level, nested objects, tools, input items. */
+export function deleteArgumentDeep(value: unknown, name: string): unknown {
+  if (Array.isArray(value)) return value.map((v) => deleteArgumentDeep(v, name));
+  if (!isRecord(value)) return value;
+  const next: Json = {};
+  for (const [key, inner] of Object.entries(value)) {
+    if (key === name) continue;
+    next[key] = deleteArgumentDeep(inner, name);
+  }
+  return next;
+}
+
+/** Text of a Codex `function_call_output` whose `output` is a content-part array; xAI wants a string. */
+function flattenFunctionOutput(output: unknown): unknown {
+  if (!Array.isArray(output)) return output;
+  const parts = output.filter(isRecord);
+  const text = parts
+    .filter((p) => p.type === 'input_text' && typeof p.text === 'string')
+    .map((p) => p.text as string)
+    .join('');
+  if (text) return text;
+  if (parts.some((p) => typeof p.type === 'string' && (p.type as string).includes('image')))
+    return '(see attached image)';
+  return parts.length ? '(see attached media)' : '';
+}
+
+/** Apply the known xAI request normalizations (pure). */
+export function sanitizeXaiRequestBody(body: unknown, rejected: ReadonlySet<string> = learnedRejections): unknown {
+  if (!isRecord(body)) return body;
+  let next: unknown = body;
+  for (const name of new Set([...XAI_UNSUPPORTED_ARGUMENTS, ...rejected])) next = deleteArgumentDeep(next, name);
+  if (!isRecord(next)) return next;
+  if (Array.isArray(next.input)) {
+    next.input = next.input.map((item) =>
+      isRecord(item) && item.type === 'function_call_output'
+        ? { ...item, output: flattenFunctionOutput(item.output) }
+        : item,
+    );
+  }
+  return next;
+}
+
+/** Parse xAI's `Argument not supported: <name>` error body; undefined when it is something else. */
+export function unsupportedArgumentFrom(errorBody: string): string | undefined {
+  const match = /Argument not supported:\s*([A-Za-z0-9_.-]+)/.exec(errorBody);
+  return match?.[1];
 }
 
 // ─── response side: restore ──────────────────────────────────────────────
@@ -255,6 +340,7 @@ export function startXaiProxyShim(opts: XaiProxyShimOptions): XaiProxyShim {
 
       let names: FlatNameTable = new Map();
       let body: BodyInit | undefined;
+      let jsonBody: unknown;
       let model: string | undefined;
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         const text = await req.text();
@@ -265,7 +351,8 @@ export function startXaiProxyShim(opts: XaiProxyShimOptions): XaiProxyShim {
             const flattened = flattenRequestBody(parsed);
             names = flattened.names;
             if (isRecord(parsed) && typeof parsed.model === 'string') model = parsed.model;
-            body = JSON.stringify(flattened.body);
+            jsonBody = sanitizeXaiRequestBody(flattened.body);
+            body = JSON.stringify(jsonBody);
             // eslint-disable-next-line no-catch-all/no-catch-all -- a body we can't parse is forwarded byte-for-byte
           } catch {
             body = text;
@@ -276,15 +363,33 @@ export function startXaiProxyShim(opts: XaiProxyShimOptions): XaiProxyShim {
       }
 
       const headers = buildUpstreamHeaders(req.headers, opts.upstreamBaseUrl, model, clientVersion);
-      let upstream: Response;
-      try {
-        upstream = await fetchImpl(target, {
+      const send = async (payload: BodyInit | undefined): Promise<Response> =>
+        fetchImpl(target, {
           method: req.method,
           headers,
-          body,
+          body: payload,
           // Bun-specific: route through the container's credential proxy and trust its CA.
           ...({ proxy, ...(ca ? { tls: { ca } } : {}) } as Record<string, unknown>),
         } as RequestInit);
+
+      let upstream: Response;
+      try {
+        upstream = await send(body);
+        // xAI names the offending argument; drop it and retry, a few times at most.
+        for (
+          let attempt = 0;
+          attempt < MAX_ARGUMENT_RETRIES && upstream.status === 400 && jsonBody !== undefined;
+          attempt += 1
+        ) {
+          const errorText = await upstream.clone().text();
+          const rejected = unsupportedArgumentFrom(errorText);
+          if (!rejected) break;
+          rememberRejectedArgument(rejected);
+          log(`xAI rejected argument "${rejected}" — retrying without it`);
+          jsonBody = deleteArgumentDeep(jsonBody, rejected);
+          body = JSON.stringify(jsonBody);
+          upstream = await send(body);
+        }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         log(`upstream request failed: ${message}`);
