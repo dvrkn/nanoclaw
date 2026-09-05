@@ -67,30 +67,48 @@ type OnecliSecret = XaiVaultSecret;
 
 const vault = () => createXaiVaultClient();
 
-/** The vault entry either auth mode creates: by name, or by the backend host it rewrites for. */
+/**
+ * The vault entry THIS walk-through owns — matched by our name only. A secret
+ * the operator created themselves for an xAI host (an `XAI_API_KEY` migrated
+ * from .env, say) is never reused or overwritten: it may hold a different
+ * credential for a different backend, and its value cannot be recovered.
+ */
 export function findXaiSecret(secrets: OnecliSecret[]): OnecliSecret | undefined {
-  return secrets.find((s) => {
-    const name = s.name.toLowerCase();
+  return secrets.find((s) => s.name.toLowerCase() === XAI_SECRET_NAME.toLowerCase());
+}
+
+/** Operator-owned secrets that already rewrite an xAI backend host — reported, never touched. */
+export function findForeignXaiSecrets(secrets: OnecliSecret[]): OnecliSecret[] {
+  const ours = findXaiSecret(secrets);
+  return secrets.filter((s) => {
+    if (s === ours) return false;
     const hostPattern = (s.hostPattern ?? '').toLowerCase();
-    return (
-      name === XAI_SECRET_NAME.toLowerCase() ||
-      name === 'grok' ||
-      hostPattern.includes(XAI_GROK_OAUTH_HOST) ||
-      hostPattern.includes(XAI_API_HOST)
-    );
+    return hostPattern.includes(XAI_GROK_OAUTH_HOST) || hostPattern.includes(XAI_API_HOST);
   });
 }
 
-async function existingXaiSecret(): Promise<OnecliSecret | undefined> {
+async function listVaultSecrets(): Promise<OnecliSecret[]> {
   try {
-    return findXaiSecret(await vault().list());
+    return await vault().list();
   } catch {
-    return undefined;
+    return [];
   }
 }
 
-/** Create the Bearer-rewrite secret for a backend host; returns its id when the backend reports one. */
-async function createXaiVaultSecret(value: string, hostPattern: string): Promise<string | undefined> {
+/**
+ * Land a credential for a backend host in OUR secret: update it in place when it
+ * exists (moving its host pattern when the auth mode changed), create it
+ * otherwise. Returns the secret id when the backend reports one.
+ */
+async function vaultXaiCredential(
+  existing: OnecliSecret | undefined,
+  value: string,
+  hostPattern: string,
+): Promise<string | undefined> {
+  if (existing) {
+    await vault().update(existing.id, value, existing.hostPattern === hostPattern ? undefined : { hostPattern });
+    return existing.id;
+  }
   const id = await vault().create({
     name: XAI_SECRET_NAME,
     value,
@@ -98,11 +116,20 @@ async function createXaiVaultSecret(value: string, hostPattern: string): Promise
     headerName: 'Authorization',
     valueFormat: 'Bearer {value}',
   });
-  return id ?? (await existingXaiSecret())?.id;
+  return id ?? findXaiSecret(await listVaultSecrets())?.id;
 }
 
-async function updateXaiVaultSecret(secretId: string, value: string): Promise<void> {
-  await vault().update(secretId, value);
+function warnAboutForeignSecrets(secrets: OnecliSecret[], hostPattern: string): void {
+  const clashing = findForeignXaiSecrets(secrets).filter((s) =>
+    (s.hostPattern ?? '').toLowerCase().includes(hostPattern),
+  );
+  if (clashing.length === 0) return;
+  p.log.warn(
+    brandBody(
+      `The vault already rewrites ${hostPattern} through ${clashing.map((s) => `"${s.name}"`).join(', ')}. ` +
+        'That entry is left untouched, but two secrets on one host is ambiguous — remove the one you no longer need (`onecli secrets delete --id <id>`).',
+    ),
+  );
 }
 
 // ─── device-code login (UI-agnostic core) ────────────────────────────────
@@ -184,7 +211,8 @@ function readCredentialOrNull(): ReturnType<typeof readXaiCredential> {
 }
 
 export async function runXaiAuthStep(): Promise<void> {
-  const secret = await existingXaiSecret();
+  const secrets = await listVaultSecrets();
+  const secret = findXaiSecret(secrets);
   const credential = readCredentialOrNull();
   if (secret && !credential?.needsRelogin) {
     p.log.success(brandBody('Your xAI account is already connected.'));
@@ -235,13 +263,13 @@ export async function runXaiAuthStep(): Promise<void> {
   }
 
   if (method === 'api') {
-    await runXaiApiKeyAuth(secret);
+    await runXaiApiKeyAuth(secret, secrets);
     return;
   }
-  await runXaiOAuthAuth(secret);
+  await runXaiOAuthAuth(secret, secrets);
 }
 
-async function runXaiApiKeyAuth(existing: OnecliSecret | undefined): Promise<void> {
+async function runXaiApiKeyAuth(existing: OnecliSecret | undefined, secrets: OnecliSecret[]): Promise<void> {
   const key = ensureAnswer(
     await p.password({
       message: 'Paste your xAI API key (xai-…)',
@@ -252,8 +280,7 @@ async function runXaiApiKeyAuth(existing: OnecliSecret | undefined): Promise<voi
   const model = await askModel({ models: [] }, XAI_DEFAULT_MODEL_ID);
 
   try {
-    if (existing) await updateXaiVaultSecret(existing.id, key.trim());
-    else await createXaiVaultSecret(key.trim(), XAI_API_HOST);
+    await vaultXaiCredential(existing, key.trim(), XAI_API_HOST);
   } catch (err) {
     setupLog.step('auth', 'failed', 0, { PROVIDER: 'xai', METHOD: 'api', ERROR: String(err) });
     p.log.error(
@@ -266,13 +293,14 @@ async function runXaiApiKeyAuth(existing: OnecliSecret | undefined): Promise<voi
   // An API key never expires on its own — a stale OAuth record must not keep
   // the refresher rotating this secret.
   fs.rmSync(xaiCredentialPath(), { force: true });
+  warnAboutForeignSecrets(secrets, XAI_API_HOST);
   upsertEnvVar('XAI_BASE_URL', XAI_API_BASE_URL);
   upsertEnvVar('XAI_DEFAULT_MODEL', model);
   setupLog.step('auth', 'success', 0, { PROVIDER: 'xai', METHOD: 'api', MODEL: model });
   p.log.success(brandBody('xAI account connected — the key lives in your OneCLI vault, never in the container.'));
 }
 
-export async function runXaiOAuthAuth(existing: OnecliSecret | undefined): Promise<void> {
+export async function runXaiOAuthAuth(existing: OnecliSecret | undefined, secrets: OnecliSecret[] = []): Promise<void> {
   const headless = isHeadless();
   p.log.step(brandBody('Starting the Grok sign-in…'));
   console.log(
@@ -326,10 +354,9 @@ export async function runXaiOAuthAuth(existing: OnecliSecret | undefined): Promi
   const catalog = await discoverCatalog(login.tokens.accessToken);
   const model = await askModel(catalog, catalog.defaultModel ?? XAI_DEFAULT_MODEL_ID);
 
-  let secretId: string | undefined = existing?.id;
+  let secretId: string | undefined;
   try {
-    if (existing) await updateXaiVaultSecret(existing.id, login.tokens.accessToken);
-    else secretId = await createXaiVaultSecret(login.tokens.accessToken, XAI_GROK_OAUTH_HOST);
+    secretId = await vaultXaiCredential(existing, login.tokens.accessToken, XAI_GROK_OAUTH_HOST);
   } catch (err) {
     setupLog.step('auth', 'failed', Date.now() - start, { PROVIDER: 'xai', METHOD: 'oauth', ERROR: String(err) });
     p.log.error(
@@ -358,6 +385,7 @@ export async function runXaiOAuthAuth(existing: OnecliSecret | undefined): Promi
       ),
     );
   }
+  warnAboutForeignSecrets(secrets, XAI_GROK_OAUTH_HOST);
   upsertEnvVar('XAI_BASE_URL', XAI_GROK_OAUTH_BASE_URL);
   upsertEnvVar('XAI_DEFAULT_MODEL', model);
   setupLog.step('auth', 'success', Date.now() - start, {

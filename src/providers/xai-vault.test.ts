@@ -66,6 +66,16 @@ describe('gateway transport', () => {
     expect(gw.calls[2]!.headers.get('content-type')).toBe('application/json');
   });
 
+  it('moves our secret to another backend host when asked (auth-mode switch)', async () => {
+    const gw = fakeGateway(() => new Response(null, { status: 204 }));
+    await createXaiVaultClient({ url: 'http://localhost:10254', apiKey: null, fetchImpl: gw.fetchImpl }).update(
+      's1',
+      'tok',
+      { hostPattern: 'api.x.ai' },
+    );
+    expect(gw.calls[0]!.body).toEqual({ value: 'tok', hostPattern: 'api.x.ai' });
+  });
+
   it('omits the Authorization header for a keyless local gateway', async () => {
     const gw = fakeGateway(() => json(200, []));
     await createXaiVaultClient({ url: 'http://localhost:10254', apiKey: '', fetchImpl: gw.fetchImpl }).list();
@@ -104,8 +114,20 @@ describe('CLI fallback', () => {
       }),
     ).toBe('c2');
     await vault.update('c2', 'tok-2');
+    runCli.mockResolvedValueOnce('{}');
+    await vault.update('c2', 'tok-3', { hostPattern: 'api.x.ai' });
 
     expect(runCli.mock.calls[0]![0]).toEqual(['secrets', 'list']);
+    expect(runCli.mock.calls[3]![0]).toEqual([
+      'secrets',
+      'update',
+      '--id',
+      'c2',
+      '--value',
+      'tok-3',
+      '--host-pattern',
+      'api.x.ai',
+    ]);
     expect(runCli.mock.calls[1]![0]).toEqual([
       'secrets',
       'create',

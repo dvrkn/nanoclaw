@@ -44,7 +44,8 @@ export interface XaiVaultClient {
   list(): Promise<XaiVaultSecret[]>;
   /** Returns the new secret's id when the backend reports one. */
   create(input: XaiVaultCreateInput): Promise<string | undefined>;
-  update(id: string, value: string): Promise<void>;
+  /** Rotate the value; `hostPattern` moves the secret to another backend host (our own secret only). */
+  update(id: string, value: string, opts?: { hostPattern?: string }): Promise<void>;
 }
 
 export interface XaiVaultClientOptions {
@@ -149,8 +150,11 @@ function gatewayClient(url: string, apiKey: string | undefined, fetchImpl: typeo
           injectionConfig: { headerName: input.headerName, valueFormat: input.valueFormat },
         }),
       ),
-    update: async (id, value) => {
-      await request('PATCH', `/v1/secrets/${encodeURIComponent(id)}`, { value });
+    update: async (id, value, opts) => {
+      await request('PATCH', `/v1/secrets/${encodeURIComponent(id)}`, {
+        value,
+        ...(opts?.hostPattern ? { hostPattern: opts.hostPattern } : {}),
+      });
     },
   };
 }
@@ -192,8 +196,16 @@ function cliClient(runCli: (args: string[]) => Promise<string>): XaiVaultClient 
           input.valueFormat,
         ]),
       ),
-    update: async (id, value) => {
-      await runCli(['secrets', 'update', '--id', id, '--value', value]);
+    update: async (id, value, opts) => {
+      await runCli([
+        'secrets',
+        'update',
+        '--id',
+        id,
+        '--value',
+        value,
+        ...(opts?.hostPattern ? ['--host-pattern', opts.hostPattern] : []),
+      ]);
     },
   };
 }
