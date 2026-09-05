@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 // Keep the auth flow's structured logging out of logs/setup.log.
 vi.mock('../logs.js', () => ({ step: vi.fn(), userInput: vi.fn() }));
 
-import { findXaiSecret, parseCreatedSecretId, runXaiDeviceCodeLogin, verifyXaiInstall } from './xai.js';
+import { findXaiSecret, runXaiDeviceCodeLogin, verifyXaiInstall } from './xai.js';
 import { XAI_OAUTH_DISCOVERY_URL } from '../../src/providers/xai-oauth.js';
 
 // Structural guard for the xai payload wiring: provider files, the three
@@ -27,14 +27,6 @@ describe('findXaiSecret', () => {
     expect(findXaiSecret([other, byProxyHost])).toBe(byProxyHost);
     expect(findXaiSecret([other, byApiHost])).toBe(byApiHost);
     expect(findXaiSecret([other])).toBeUndefined();
-  });
-});
-
-describe('parseCreatedSecretId', () => {
-  it('reads the id from either CLI envelope shape and tolerates non-JSON', () => {
-    expect(parseCreatedSecretId('{"data":{"id":"sec-1","name":"xAI"}}')).toBe('sec-1');
-    expect(parseCreatedSecretId('{"id":"sec-2"}')).toBe('sec-2');
-    expect(parseCreatedSecretId('Created.')).toBeUndefined();
   });
 });
 

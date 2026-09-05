@@ -20,7 +20,6 @@
  * Which backend the credential is valid for is recorded (non-secret) as
  * XAI_BASE_URL in .env, with the chosen default model as XAI_DEFAULT_MODEL.
  */
-import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -56,21 +55,17 @@ import {
   type XaiOAuthIdentity,
   type XaiOAuthTokens,
 } from '../../src/providers/xai-oauth.js';
+import { createXaiVaultClient, type XaiVaultSecret } from '../../src/providers/xai-vault.js';
 
 // ─── OneCLI vault helpers ────────────────────────────────────────────────
+//
+// Gateway REST when ONECLI_URL is configured (the same URL the host uses), the
+// `onecli` CLI otherwise — see src/providers/xai-vault.ts. Either way the
+// secret value rides a JSON body or argv, never a shell string.
 
-interface OnecliSecret {
-  id: string;
-  name: string;
-  type: string;
-  hostPattern: string | null;
-}
+type OnecliSecret = XaiVaultSecret;
 
-function listSecrets(): OnecliSecret[] {
-  const out = execFileSync('onecli', ['secrets', 'list'], { encoding: 'utf-8' });
-  const parsed = JSON.parse(out) as { data?: unknown };
-  return Array.isArray(parsed.data) ? (parsed.data as OnecliSecret[]) : [];
-}
+const vault = () => createXaiVaultClient();
 
 /** The vault entry either auth mode creates: by name, or by the backend host it rewrites for. */
 export function findXaiSecret(secrets: OnecliSecret[]): OnecliSecret | undefined {
@@ -86,58 +81,28 @@ export function findXaiSecret(secrets: OnecliSecret[]): OnecliSecret | undefined
   });
 }
 
-function existingXaiSecret(): OnecliSecret | undefined {
+async function existingXaiSecret(): Promise<OnecliSecret | undefined> {
   try {
-    return findXaiSecret(listSecrets());
+    return findXaiSecret(await vault().list());
   } catch {
     return undefined;
   }
 }
 
-/** `onecli secrets create` prints JSON; take the id from either envelope shape. */
-export function parseCreatedSecretId(stdout: string): string | undefined {
-  try {
-    const parsed = JSON.parse(stdout) as { data?: { id?: unknown }; id?: unknown };
-    const id = parsed.data?.id ?? parsed.id;
-    return typeof id === 'string' && id.trim() ? id : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-const bearerSecretArgs = (hostPattern: string): string[] => [
-  '--host-pattern',
-  hostPattern,
-  '--header-name',
-  'Authorization',
-  '--value-format',
-  'Bearer {value}',
-];
-
-/** Create the vault entry; returns its id when the CLI reports one. `value` is a credential — argv only, never logged. */
-function createXaiVaultSecret(value: string, hostPattern: string): string | undefined {
-  const out = execFileSync(
-    'onecli',
-    [
-      'secrets',
-      'create',
-      '--name',
-      XAI_SECRET_NAME,
-      '--type',
-      'generic',
-      '--value',
-      value,
-      ...bearerSecretArgs(hostPattern),
-    ],
-    { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] },
-  );
-  return parseCreatedSecretId(out) ?? existingXaiSecret()?.id;
-}
-
-function updateXaiVaultSecret(secretId: string, value: string): void {
-  execFileSync('onecli', ['secrets', 'update', '--id', secretId, '--value', value], {
-    stdio: ['ignore', 'pipe', 'pipe'],
+/** Create the Bearer-rewrite secret for a backend host; returns its id when the backend reports one. */
+async function createXaiVaultSecret(value: string, hostPattern: string): Promise<string | undefined> {
+  const id = await vault().create({
+    name: XAI_SECRET_NAME,
+    value,
+    hostPattern,
+    headerName: 'Authorization',
+    valueFormat: 'Bearer {value}',
   });
+  return id ?? (await existingXaiSecret())?.id;
+}
+
+async function updateXaiVaultSecret(secretId: string, value: string): Promise<void> {
+  await vault().update(secretId, value);
 }
 
 // ─── device-code login (UI-agnostic core) ────────────────────────────────
@@ -219,7 +184,7 @@ function readCredentialOrNull(): ReturnType<typeof readXaiCredential> {
 }
 
 export async function runXaiAuthStep(): Promise<void> {
-  const secret = existingXaiSecret();
+  const secret = await existingXaiSecret();
   const credential = readCredentialOrNull();
   if (secret && !credential?.needsRelogin) {
     p.log.success(brandBody('Your xAI account is already connected.'));
@@ -287,12 +252,14 @@ async function runXaiApiKeyAuth(existing: OnecliSecret | undefined): Promise<voi
   const model = await askModel({ models: [] }, XAI_DEFAULT_MODEL_ID);
 
   try {
-    if (existing) updateXaiVaultSecret(existing.id, key.trim());
-    else createXaiVaultSecret(key.trim(), XAI_API_HOST);
+    if (existing) await updateXaiVaultSecret(existing.id, key.trim());
+    else await createXaiVaultSecret(key.trim(), XAI_API_HOST);
   } catch (err) {
     setupLog.step('auth', 'failed', 0, { PROVIDER: 'xai', METHOD: 'api', ERROR: String(err) });
     p.log.error(
-      brandBody("Couldn't save your xAI key to the vault. Make sure OneCLI is running (`onecli version`), then retry."),
+      brandBody(
+        "Couldn't save your xAI key to the vault. Make sure the OneCLI gateway is reachable (ONECLI_URL in .env, or `onecli version`), then retry.",
+      ),
     );
     process.exit(1);
   }
@@ -361,13 +328,13 @@ export async function runXaiOAuthAuth(existing: OnecliSecret | undefined): Promi
 
   let secretId: string | undefined = existing?.id;
   try {
-    if (existing) updateXaiVaultSecret(existing.id, login.tokens.accessToken);
-    else secretId = createXaiVaultSecret(login.tokens.accessToken, XAI_GROK_OAUTH_HOST);
+    if (existing) await updateXaiVaultSecret(existing.id, login.tokens.accessToken);
+    else secretId = await createXaiVaultSecret(login.tokens.accessToken, XAI_GROK_OAUTH_HOST);
   } catch (err) {
     setupLog.step('auth', 'failed', Date.now() - start, { PROVIDER: 'xai', METHOD: 'oauth', ERROR: String(err) });
     p.log.error(
       brandBody(
-        "Couldn't save your Grok token to the vault. Make sure OneCLI is running (`onecli version`), then retry.",
+        "Couldn't save your Grok token to the vault. Make sure the OneCLI gateway is reachable (ONECLI_URL in .env, or `onecli version`), then retry.",
       ),
     );
     process.exit(1);
@@ -473,6 +440,7 @@ export function verifyXaiInstall(): { ok: boolean; problems: string[] } {
     'src/providers/xai.ts',
     'src/providers/xai-oauth.ts',
     'src/providers/xai-oauth-refresh.ts',
+    'src/providers/xai-vault.ts',
     'container/agent-runner/src/providers/xai.ts',
     // The codex payload xai composes.
     'src/providers/codex.ts',
