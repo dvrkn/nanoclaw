@@ -26,7 +26,12 @@ import { startXaiOAuthRefresher } from './xai-oauth-refresh.js';
  * passes into xai containers. `XAI_BASE_URL` selects the backend the vaulted
  * credential is valid for (Grok proxy for OAuth, `api.x.ai` for an API key).
  */
-export const XAI_ENV_PASSTHROUGH = ['XAI_BASE_URL', 'XAI_DEFAULT_MODEL', 'XAI_GROK_CLIENT_VERSION'] as const;
+export const XAI_ENV_PASSTHROUGH = [
+  'XAI_BASE_URL',
+  'XAI_DEFAULT_MODEL',
+  'XAI_GROK_CLIENT_VERSION',
+  'XAI_SHIM_DEBUG',
+] as const;
 
 export function resolveXaiContainerEnv(
   hostEnv: NodeJS.ProcessEnv,
@@ -37,10 +42,13 @@ export function resolveXaiContainerEnv(
     const value = hostEnv[key] ?? dotenv[key];
     return value?.trim() ? value.trim() : undefined;
   };
+  const debug = pick('XAI_SHIM_DEBUG');
   return {
     XAI_BASE_URL: pick('XAI_BASE_URL') ?? XAI_GROK_OAUTH_BASE_URL,
     XAI_DEFAULT_MODEL: pick('XAI_DEFAULT_MODEL') ?? XAI_DEFAULT_MODEL_ID,
     XAI_GROK_CLIENT_VERSION: pick('XAI_GROK_CLIENT_VERSION') ?? XAI_GROK_CLIENT_VERSION,
+    // Opt-in shim diagnostics (shape-only log in the agent workspace); absent by default.
+    ...(debug ? { XAI_SHIM_DEBUG: debug } : {}),
   };
 }
 

@@ -10,7 +10,8 @@ import {
   _resetLearnedRejectionsForTesting,
   buildUpstreamHeaders,
   createSseRestoreTransform,
-  deleteArgumentDeep,
+  deleteArgument,
+  describeRequestShape,
   flattenRequestBody,
   flattenToolName,
   restoreResponseJson,
@@ -120,14 +121,51 @@ describe('xAI request compatibility', () => {
     expect((sanitizeXaiRequestBody(body, new Set(['summary'])) as any).reasoning).toEqual({ effort: 'high' });
   });
 
-  it("parses xAI's rejection message and deletes the argument deeply", () => {
+  it("parses xAI's rejection message and deletes the argument only where xAI validates it", () => {
     expect(unsupportedArgumentFrom('{"code":"400","error":"Argument not supported: external_web_access"}')).toBe(
       'external_web_access',
     );
     expect(unsupportedArgumentFrom('{"error":"something else"}')).toBeUndefined();
-    expect(deleteArgumentDeep({ a: 1, nested: { a: 2, b: [{ a: 3, c: 4 }] } }, 'a')).toEqual({
-      nested: { b: [{ c: 4 }] },
+    const body = {
+      id: 'top',
+      reasoning: { effort: 'high', id: 'r' },
+      text: { id: 't', format: { type: 'text' } },
+      tools: [{ type: 'web_search', id: 'w' }],
+      // Replay data stays byte-for-byte: encrypted reasoning / compaction blobs carry ids too.
+      input: [
+        { type: 'reasoning', id: 'rs_1', encrypted_content: 'blob' },
+        { type: 'compaction', id: 'c_1', encrypted_content: 'blob2' },
+      ],
+    };
+    expect(deleteArgument(body, 'id')).toEqual({
+      reasoning: { effort: 'high' },
+      text: { format: { type: 'text' } },
+      tools: [{ type: 'web_search' }],
+      input: body.input,
     });
+  });
+
+  it('describes a request by shape only — no message text', () => {
+    const shape = describeRequestShape({
+      model: 'grok-4.6',
+      instructions: 'SECRET PROMPT',
+      reasoning: { effort: 'high' },
+      include: ['reasoning.encrypted_content'],
+      tools: [{ type: 'function', name: 'shell_command' }, { type: 'web_search' }],
+      input: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'SECRET' }] },
+        { type: 'reasoning', id: 'rs_1', encrypted_content: 'blob' },
+      ],
+    });
+    expect(shape).toEqual({
+      keys: ['include', 'input', 'instructions', 'model', 'reasoning', 'tools'],
+      reasoning: ['effort'],
+      text: undefined,
+      include: ['reasoning.encrypted_content'],
+      tools: ['function:shell_command', 'web_search'],
+      input: ['message/user', 'reasoning+enc+id'],
+    });
+    expect(JSON.stringify(shape)).not.toContain('SECRET');
   });
 });
 
@@ -242,6 +280,7 @@ describe('end to end against a fake upstream', () => {
     upstreamBaseUrl: `http://127.0.0.1:${upstream.port}/v1`,
     proxy: null,
     caPath: null,
+    debugLogPath: null,
   });
   afterAll(() => {
     shim.stop();
