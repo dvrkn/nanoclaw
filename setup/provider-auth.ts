@@ -21,10 +21,11 @@ import './providers/index.js';
 // Hard-wired install skills — the audited control surface (no branch
 // enumeration). Each `/add-<name>` SKILL.md is idempotent and self-skips when
 // the payload is already wired; it is applied in-process via the directive
-// engine (no shell-out to a drift-prone setup/add-<name>.sh). Codex is the only
-// manifest-style provider today.
-const INSTALL_SKILLS: Record<string, string> = {
-  codex: '.claude/skills/add-codex',
+// engine (no shell-out to a drift-prone setup/add-<name>.sh). A provider that
+// composes another's payload lists that skill first (xai runs on codex).
+const INSTALL_SKILLS: Record<string, readonly string[]> = {
+  codex: ['.claude/skills/add-codex'],
+  xai: ['.claude/skills/add-codex', '.claude/skills/add-xai'],
 };
 
 export async function run(args: string[]): Promise<void> {
@@ -40,8 +41,8 @@ export async function run(args: string[]): Promise<void> {
   }
 
   let entry = getSetupProvider(name);
-  const skillDir = INSTALL_SKILLS[name];
-  if (skillDir) {
+  const skillDirs = INSTALL_SKILLS[name];
+  if (skillDirs) {
     // Install OR refresh: the skill is idempotent and is also the upgrade path
     // — payload files resync and a bumped CLI-manifest pin replaces the local
     // one. Applied in-process via the directive engine; build + auth are this
@@ -49,10 +50,14 @@ export async function run(args: string[]): Promise<void> {
     // we rebuild the image whenever the install mutated anything (the container
     // CLI manifest is baked into the image, unlike the mounted payload code).
     console.log(`${entry ? 'Refreshing' : 'Installing'} ${name}…`);
-    const { changed, blockers } = await applyProviderSkill(skillDir, process.cwd());
-    if (blockers.length) {
-      console.error(`Couldn't install ${name}: ${blockers.join('; ')}`);
-      process.exit(1);
+    let changed = false;
+    for (const skillDir of skillDirs) {
+      const result = await applyProviderSkill(skillDir, process.cwd());
+      if (result.blockers.length) {
+        console.error(`Couldn't install ${name} (${skillDir}): ${result.blockers.join('; ')}`);
+        process.exit(1);
+      }
+      changed = changed || result.changed;
     }
     if (changed) {
       console.log('Provider payload installed — rebuilding the container image…');

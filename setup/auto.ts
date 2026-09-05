@@ -455,17 +455,26 @@ async function main(): Promise<void> {
       // self-skips if already installed), rebuild the image (the container step
       // already ran, the CLI manifest just changed), then load the payload's
       // setup module so it self-registers.
-      const skillDir = `.claude/skills/add-${agentProvider}`;
+      // A provider's skills, in order (a composed payload's skill first); the
+      // convention `.claude/skills/add-<provider>` covers one without a list.
+      const skills = INSTALLABLE_PROVIDERS.find((prov) => prov.value === agentProvider)?.skills;
+      const skillDirs = skills
+        ? skills.map((skill) => `.claude/skills/${skill}`)
+        : [`.claude/skills/add-${agentProvider}`];
       const s = p.spinner();
       s.start(`Installing ${agentProvider}…`);
-      let blockers: string[];
+      const blockers: string[] = [];
       try {
-        ({ blockers } = await applyProviderSkill(skillDir, process.cwd()));
+        for (const skillDir of skillDirs) {
+          const result = await applyProviderSkill(skillDir, process.cwd());
+          blockers.push(...result.blockers.map((b) => `${skillDir}: ${b}`));
+          if (blockers.length) break;
+        }
       } catch (err) {
         s.stop(`Couldn't install ${agentProvider}.`, 1);
         const message = err instanceof Error ? err.message : String(err);
         await fail(`add-${agentProvider}`, `Couldn't install ${agentProvider}.`, message);
-        return; // unreachable — fail() exits — but narrows blockers for TS
+        return; // unreachable — fail() exits — but narrows for TS
       }
       if (blockers.length) {
         s.stop(`Couldn't install ${agentProvider}.`, 1);
@@ -923,11 +932,18 @@ function sendChatMessage(message: string): Promise<void> {
 
 // Providers offered for install are hard-wired in trunk — an audited control
 // surface (no branch enumeration that anyone with write access could extend).
-// Codex is the only one offered here; opencode/ollama install via their own
-// /add-* skills. Each is installed by applying its `/add-<name>` SKILL.md
-// in-process via the directive engine.
+// opencode/ollama install via their own /add-* skills. Each is installed by
+// applying its `/add-<name>` SKILL.md(s) in-process via the directive engine,
+// in order — a provider that composes another's payload lists that skill first
+// (xai runs on the codex runtime).
 const INSTALLABLE_PROVIDERS = [
-  { value: 'codex', label: 'Codex', hint: 'OpenAI — ChatGPT subscription or API key' },
+  { value: 'codex', label: 'Codex', hint: 'OpenAI — ChatGPT subscription or API key', skills: ['add-codex'] },
+  {
+    value: 'xai',
+    label: 'xAI (Grok)',
+    hint: 'SuperGrok subscription or xAI API key — runs on the Codex runtime',
+    skills: ['add-codex', 'add-xai'],
+  },
 ] as const;
 
 // `pickSavedByPreviousRun`: the .env bridge promoted a pick persisted by a
@@ -1087,9 +1103,7 @@ async function chooseTemplate(templates: TemplateEntry[]): Promise<string | unde
 }
 
 type TemplateAgentOutcome = 'none' | 'channel-target' | 'restamped';
-type TemplateSetupOperation =
-  | TemplateOperation
-  | { kind: 'connect'; agentGroupId: string };
+type TemplateSetupOperation = TemplateOperation | { kind: 'connect'; agentGroupId: string };
 
 async function installSelectedTemplateAgent(provider?: string): Promise<TemplateAgentOutcome> {
   const ref = process.env.NANOCLAW_TEMPLATE_PATH?.trim();
@@ -1137,9 +1151,7 @@ async function installSelectedTemplateAgent(provider?: string): Promise<Template
     }
 
     const name =
-      operation.kind === 'create' && agents.length > 0
-        ? await askNewTemplateAgentName(agents, presetName)
-        : presetName;
+      operation.kind === 'create' && agents.length > 0 ? await askNewTemplateAgentName(agents, presetName) : presetName;
 
     p.log.step(
       brandBody(
@@ -1235,11 +1247,13 @@ async function chooseTemplateOperation(
   const options = agents.flatMap((agent) => [
     ...(agent.isWired
       ? []
-      : [{
-          value: { kind: 'connect', agentGroupId: agent.id } as const,
-          label: `Connect "${agent.name}" to a channel`,
-          hint: `groups/${agent.folder} · not connected`,
-        }]),
+      : [
+          {
+            value: { kind: 'connect', agentGroupId: agent.id } as const,
+            label: `Connect "${agent.name}" to a channel`,
+            hint: `groups/${agent.folder} · not connected`,
+          },
+        ]),
     {
       value: { kind: 'restamp', agentGroupId: agent.id } as const,
       label: `Update "${agent.name}" in place`,
@@ -1264,10 +1278,7 @@ async function chooseTemplateOperation(
   return choice.kind === 'cancel' ? undefined : choice;
 }
 
-async function askNewTemplateAgentName(
-  agents: readonly AgentGroup[],
-  initialValue?: string,
-): Promise<string> {
+async function askNewTemplateAgentName(agents: readonly AgentGroup[], initialValue?: string): Promise<string> {
   const answer = ensureAnswer(
     await p.text({
       message: 'Name the new agent',
