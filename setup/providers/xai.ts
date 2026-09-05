@@ -470,6 +470,7 @@ export function verifyXaiInstall(): { ok: boolean; problems: string[] } {
     'src/providers/xai-oauth-refresh.ts',
     'src/providers/xai-vault.ts',
     'container/agent-runner/src/providers/xai.ts',
+    'container/agent-runner/src/providers/xai-proxy-shim.ts',
     // The codex payload xai composes.
     'src/providers/codex.ts',
     'container/agent-runner/src/providers/codex.ts',
