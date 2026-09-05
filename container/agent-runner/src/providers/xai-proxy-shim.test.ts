@@ -121,6 +121,44 @@ describe('xAI request compatibility', () => {
     expect((sanitizeXaiRequestBody(body, new Set(['summary'])) as any).reasoning).toEqual({ effort: 'high' });
   });
 
+  it('normalizes replayed reasoning items the way the proxy decodes them (null content, missing summary)', () => {
+    // Codex stores `content: null` on every reasoning item; the proxy answers
+    // "Could not decode the compaction blob" to that key and to a missing summary.
+    const body = {
+      model: 'grok-4.6',
+      input: [
+        {
+          type: 'reasoning',
+          id: 'rs_1',
+          summary: [{ type: 'summary_text', text: 's' }],
+          content: null,
+          encrypted_content: 'blob',
+        },
+        { type: 'reasoning', id: 'rs_2', encrypted_content: 'blob2' },
+        {
+          type: 'reasoning',
+          id: 'rs_3',
+          summary: [],
+          content: [{ type: 'reasoning_text', text: 'x' }],
+          encrypted_content: 'blob3',
+        },
+        { type: 'message', role: 'assistant', content: null },
+      ],
+    };
+    const out = sanitizeXaiRequestBody(body, new Set()) as { input: Array<Record<string, unknown>> };
+    expect(out.input[0]).toEqual({
+      type: 'reasoning',
+      id: 'rs_1',
+      summary: [{ type: 'summary_text', text: 's' }],
+      encrypted_content: 'blob',
+    });
+    expect(out.input[1]).toEqual({ type: 'reasoning', id: 'rs_2', summary: [], encrypted_content: 'blob2' });
+    // Real content is kept; only null is a serialization artifact.
+    expect(out.input[2]).toEqual(body.input[2]);
+    // Other item types are not touched.
+    expect(out.input[3]).toEqual(body.input[3]);
+  });
+
   it("parses xAI's rejection message and deletes the argument only where xAI validates it", () => {
     expect(unsupportedArgumentFrom('{"code":"400","error":"Argument not supported: external_web_access"}')).toBe(
       'external_web_access',
