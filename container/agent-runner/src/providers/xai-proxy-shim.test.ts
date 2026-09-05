@@ -7,13 +7,17 @@
 import { afterAll, describe, expect, it } from 'bun:test';
 
 import {
+  _resetLearnedRejectionsForTesting,
   buildUpstreamHeaders,
   createSseRestoreTransform,
+  deleteArgumentDeep,
   flattenRequestBody,
   flattenToolName,
   restoreResponseJson,
   restoreSseLine,
+  sanitizeXaiRequestBody,
   startXaiProxyShim,
+  unsupportedArgumentFrom,
 } from './xai-proxy-shim.js';
 
 const codexRequest = {
@@ -76,6 +80,54 @@ describe('request flattening', () => {
     const { body, names } = flattenRequestBody({ model: 'grok-4.6', input: 'hi' });
     expect(body).toEqual({ model: 'grok-4.6', input: 'hi' });
     expect(names.size).toBe(0);
+  });
+});
+
+describe('xAI request compatibility', () => {
+  it('drops known OpenAI-only arguments wherever they sit and flattens tool outputs to strings', () => {
+    const body = {
+      model: 'grok-4.6',
+      prompt_cache_key: 'abc',
+      service_tier: 'auto',
+      text: { verbosity: 'medium', format: { type: 'text' } },
+      reasoning: { effort: 'high', summary: 'auto' },
+      tools: [
+        { type: 'web_search', external_web_access: true, indexed_web_access: true },
+        { type: 'function', name: 'f' },
+      ],
+      input: [
+        {
+          type: 'function_call_output',
+          call_id: 'c1',
+          output: [
+            { type: 'input_text', text: 'ok ' },
+            { type: 'input_text', text: 'done' },
+          ],
+        },
+        { type: 'function_call_output', call_id: 'c2', output: [{ type: 'input_image', image_url: 'data:...' }] },
+        { type: 'function_call_output', call_id: 'c3', output: 'plain' },
+      ],
+    };
+    const out = sanitizeXaiRequestBody(body, new Set()) as Record<string, any>;
+    expect(out.prompt_cache_key).toBeUndefined();
+    expect(out.service_tier).toBeUndefined();
+    expect(out.text).toEqual({ format: { type: 'text' } });
+    // reasoning.effort is supported by the Grok models; only unknown knobs go.
+    expect(out.reasoning).toEqual({ effort: 'high', summary: 'auto' });
+    expect(out.tools[0]).toEqual({ type: 'web_search' });
+    expect(out.input.map((i: { output: unknown }) => i.output)).toEqual(['ok done', '(see attached image)', 'plain']);
+    // Learned rejections are honored too.
+    expect((sanitizeXaiRequestBody(body, new Set(['summary'])) as any).reasoning).toEqual({ effort: 'high' });
+  });
+
+  it("parses xAI's rejection message and deletes the argument deeply", () => {
+    expect(unsupportedArgumentFrom('{"code":"400","error":"Argument not supported: external_web_access"}')).toBe(
+      'external_web_access',
+    );
+    expect(unsupportedArgumentFrom('{"error":"something else"}')).toBeUndefined();
+    expect(deleteArgumentDeep({ a: 1, nested: { a: 2, b: [{ a: 3, c: 4 }] } }, 'a')).toEqual({
+      nested: { b: [{ c: 4 }] },
+    });
   });
 });
 
@@ -164,6 +216,15 @@ describe('end to end against a fake upstream', () => {
     async fetch(req) {
       const body = (await req.json()) as Record<string, unknown>;
       seen.push({ path: new URL(req.url).pathname, body, headers: req.headers });
+      // Mimic xAI: refuse one unknown argument per round trip until the body is clean.
+      for (const unsupported of ['truncation', 'metadata']) {
+        if (unsupported in body) {
+          return new Response(JSON.stringify({ code: '400', error: `Argument not supported: ${unsupported}` }), {
+            status: 400,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+      }
       const item = {
         type: 'function_call',
         name: 'mcp__nanoclaw__send_message',
@@ -188,22 +249,28 @@ describe('end to end against a fake upstream', () => {
   });
 
   it('forwards a flattened request and streams back restored function calls', async () => {
+    _resetLearnedRejectionsForTesting();
     const res = await fetch(`${shim.url}/responses`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: 'Bearer placeholder' },
-      body: JSON.stringify(codexRequest),
+      body: JSON.stringify({ ...codexRequest, truncation: 'auto', metadata: { a: 1 }, prompt_cache_key: 'k' }),
     });
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('text/event-stream');
     const text = await res.text();
 
-    // Upstream saw no namespace tool and the flat name; auth rode along.
-    expect(seen).toHaveLength(1);
-    expect(seen[0]!.path).toBe('/v1/responses');
-    const tools = seen[0]!.body.tools as Array<Record<string, unknown>>;
+    // Two rejections learned on the fly, then success: three round trips, the last one clean.
+    expect(seen).toHaveLength(3);
+    expect(seen.map((s) => 'truncation' in s.body)).toEqual([true, false, false]);
+    expect(seen.map((s) => 'metadata' in s.body)).toEqual([true, true, false]);
+    // The known-unsupported argument never reached upstream at all.
+    expect(seen.every((s) => !('prompt_cache_key' in s.body))).toBe(true);
+    const last = seen[2]!;
+    expect(last.path).toBe('/v1/responses');
+    const tools = last.body.tools as Array<Record<string, unknown>>;
     expect(tools.some((t) => t.type === 'namespace')).toBe(false);
     expect(tools.map((t) => t.name)).toContain('mcp__nanoclaw__send_message');
-    expect(seen[0]!.headers.get('authorization')).toBe('Bearer placeholder');
+    expect(last.headers.get('authorization')).toBe('Bearer placeholder');
 
     // Codex gets its namespaced call back in both the item event and the completion.
     const events = text
@@ -212,5 +279,19 @@ describe('end to end against a fake upstream', () => {
       .map((l) => JSON.parse(l.slice(6)) as Record<string, unknown>);
     expect(events[0]).toMatchObject({ item: { name: 'send_message', namespace: 'mcp__nanoclaw', call_id: 'c9' } });
     expect(events[1]).toMatchObject({ response: { output: [{ name: 'send_message', namespace: 'mcp__nanoclaw' }] } });
+  });
+
+  it('remembers learned rejections so the next request is clean on the first try', async () => {
+    seen.length = 0;
+    const res = await fetch(`${shim.url}/responses`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...codexRequest, truncation: 'auto', metadata: { a: 1 } }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    expect(seen).toHaveLength(1);
+    expect('truncation' in seen[0]!.body).toBe(false);
+    expect('metadata' in seen[0]!.body).toBe(false);
   });
 });
