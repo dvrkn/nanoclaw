@@ -136,15 +136,26 @@ export function _resetLearnedRejectionsForTesting(): void {
   learnedRejections.clear();
 }
 
-/** Remove a key by name anywhere in the request: top level, nested objects, tools, input items. */
-export function deleteArgumentDeep(value: unknown, name: string): unknown {
-  if (Array.isArray(value)) return value.map((v) => deleteArgumentDeep(v, name));
+function withoutKey(value: unknown, name: string): unknown {
   if (!isRecord(value)) return value;
   const next: Json = {};
-  for (const [key, inner] of Object.entries(value)) {
-    if (key === name) continue;
-    next[key] = deleteArgumentDeep(inner, name);
+  for (const [key, inner] of Object.entries(value)) if (key !== name) next[key] = inner;
+  return next;
+}
+
+/**
+ * Remove a request argument by name where xAI validates arguments: the top
+ * level, the `reasoning` and `text` objects, and each tool definition. Never
+ * inside `input` — conversation items (encrypted reasoning, compaction blobs,
+ * tool outputs) are replay data the backend must get back byte-for-byte.
+ */
+export function deleteArgument(value: unknown, name: string): unknown {
+  if (!isRecord(value)) return value;
+  const next = withoutKey(value, name) as Json;
+  for (const nested of ['reasoning', 'text']) {
+    if (isRecord(next[nested])) next[nested] = withoutKey(next[nested], name);
   }
+  if (Array.isArray(next.tools)) next.tools = next.tools.map((tool) => withoutKey(tool, name));
   return next;
 }
 
@@ -166,7 +177,7 @@ function flattenFunctionOutput(output: unknown): unknown {
 export function sanitizeXaiRequestBody(body: unknown, rejected: ReadonlySet<string> = learnedRejections): unknown {
   if (!isRecord(body)) return body;
   let next: unknown = body;
-  for (const name of new Set([...XAI_UNSUPPORTED_ARGUMENTS, ...rejected])) next = deleteArgumentDeep(next, name);
+  for (const name of new Set([...XAI_UNSUPPORTED_ARGUMENTS, ...rejected])) next = deleteArgument(next, name);
   if (!isRecord(next)) return next;
   if (Array.isArray(next.input)) {
     next.input = next.input.map((item) =>
@@ -288,9 +299,56 @@ export function buildUpstreamHeaders(
 
 // ─── server ──────────────────────────────────────────────────────────────
 
+/**
+ * Opt-in diagnostics (XAI_SHIM_DEBUG=<path>, or `1` for the default path in the
+ * agent workspace, which the host mounts): one JSON line per upstream round
+ * trip — shape only (argument names, item types, tool types, status, learned
+ * rejections, the start of an error body). Never message text, never headers.
+ */
+export const XAI_SHIM_DEBUG_DEFAULT_PATH = '/workspace/agent/.xai-shim-debug.log';
+
+export function resolveDebugLogPath(env: Record<string, string | undefined> = process.env): string | undefined {
+  const raw = env.XAI_SHIM_DEBUG?.trim();
+  if (!raw || raw === '0' || raw.toLowerCase() === 'false') return undefined;
+  return raw === '1' || raw.toLowerCase() === 'true' ? XAI_SHIM_DEBUG_DEFAULT_PATH : raw;
+}
+
+export function describeRequestShape(body: unknown): Json {
+  if (!isRecord(body)) return { body: typeof body };
+  const items = Array.isArray(body.input) ? body.input : [];
+  return {
+    keys: Object.keys(body).sort(),
+    reasoning: isRecord(body.reasoning) ? Object.keys(body.reasoning).sort() : undefined,
+    text: isRecord(body.text) ? Object.keys(body.text).sort() : undefined,
+    include: body.include,
+    tools: Array.isArray(body.tools)
+      ? body.tools.map((t) =>
+          isRecord(t) ? `${String(t.type)}${typeof t.name === 'string' ? `:${t.name}` : ''}` : '?',
+        )
+      : undefined,
+    input: items.map((i) =>
+      isRecord(i)
+        ? `${String(i.type)}${typeof i.role === 'string' ? `/${i.role}` : ''}${'encrypted_content' in i ? '+enc' : ''}${typeof i.id === 'string' ? '+id' : ''}`
+        : '?',
+    ),
+  };
+}
+
+function appendDebug(path: string | undefined, record: Json): void {
+  if (!path) return;
+  try {
+    fs.appendFileSync(path, JSON.stringify({ at: new Date().toISOString(), ...record }) + '\n');
+    // eslint-disable-next-line no-catch-all/no-catch-all -- diagnostics must never break a request
+  } catch {
+    /* unwritable debug path: drop the line */
+  }
+}
+
 export interface XaiProxyShimOptions {
   /** Real backend, e.g. https://cli-chat-proxy.grok.com/v1 (trailing /v1 kept). */
   upstreamBaseUrl: string;
+  /** Debug log path; defaults to XAI_SHIM_DEBUG resolution. `null` disables. */
+  debugLogPath?: string | null;
   clientVersion?: string;
   fetchImpl?: typeof fetch;
   /** Outbound proxy URL (the container's OneCLI gateway). Defaults to HTTPS_PROXY/HTTP_PROXY. */
@@ -319,6 +377,7 @@ export function startXaiProxyShim(opts: XaiProxyShimOptions): XaiProxyShim {
   const proxy =
     opts.proxy === undefined ? process.env.HTTPS_PROXY || process.env.HTTP_PROXY || undefined : opts.proxy || undefined;
   const caPath = opts.caPath === undefined ? process.env.NODE_EXTRA_CA_CERTS : opts.caPath;
+  const debugLogPath = opts.debugLogPath === undefined ? resolveDebugLogPath() : opts.debugLogPath || undefined;
   let ca: string | undefined;
   if (caPath) {
     try {
@@ -373,6 +432,7 @@ export function startXaiProxyShim(opts: XaiProxyShimOptions): XaiProxyShim {
         } as RequestInit);
 
       let upstream: Response;
+      const learned: string[] = [];
       try {
         upstream = await send(body);
         // xAI names the offending argument; drop it and retry, a few times at most.
@@ -385,10 +445,22 @@ export function startXaiProxyShim(opts: XaiProxyShimOptions): XaiProxyShim {
           const rejected = unsupportedArgumentFrom(errorText);
           if (!rejected) break;
           rememberRejectedArgument(rejected);
+          learned.push(rejected);
           log(`xAI rejected argument "${rejected}" — retrying without it`);
-          jsonBody = deleteArgumentDeep(jsonBody, rejected);
+          jsonBody = deleteArgument(jsonBody, rejected);
           body = JSON.stringify(jsonBody);
           upstream = await send(body);
+        }
+        if (debugLogPath) {
+          appendDebug(debugLogPath, {
+            method: req.method,
+            path: incoming.pathname,
+            model,
+            status: upstream.status,
+            learned,
+            request: describeRequestShape(jsonBody),
+            ...(upstream.status >= 400 ? { error: (await upstream.clone().text()).slice(0, 600) } : {}),
+          });
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
