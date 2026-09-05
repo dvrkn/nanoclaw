@@ -33,6 +33,8 @@ Delete (do not comment out) the `import './xai.js';` line from each of:
 rm -f src/providers/xai.ts \
       src/providers/xai-oauth.ts \
       src/providers/xai-oauth-refresh.ts \
+      src/providers/xai-vault.ts \
+      src/providers/xai-vault.test.ts \
       src/providers/xai-registration.test.ts \
       src/providers/xai-host-contribution.test.ts \
       src/providers/xai-oauth.test.ts \

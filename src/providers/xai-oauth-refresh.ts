@@ -5,8 +5,10 @@
  * `data/xai-oauth.json` (never cached: a re-login from setup replaces the file
  * under a running host), and when the access token is inside its refresh
  * margin it runs the refresh grant, persists the rotated pair, and rotates the
- * vault copy with `onecli secrets update`. OneCLI resolves secrets per
- * request, so running containers pick the new token up without a restart.
+ * vault copy through the OneCLI gateway API (./xai-vault.ts — no `onecli`
+ * binary needed on the host, which matters when the host itself runs in a
+ * container). OneCLI resolves secrets per request, so running containers pick
+ * the new token up without a restart.
  *
  * Ordering is file-first: the rotated refresh token is written before the
  * vault push, because a consumed refresh token that never reached disk is a
@@ -18,11 +20,6 @@
  * marked `needsRelogin`, the refresher stops touching it, and the operator
  * re-runs `pnpm exec tsx setup/index.ts --step provider-auth xai`.
  */
-import { execFile } from 'child_process';
-import os from 'os';
-import path from 'path';
-import { promisify } from 'util';
-
 import { log } from '../log.js';
 import {
   applyRefreshedTokens,
@@ -34,8 +31,7 @@ import {
   type XaiOAuthCredential,
   type XaiOAuthFetchOptions,
 } from './xai-oauth.js';
-
-const execFileAsync = promisify(execFile);
+import { createXaiVaultClient } from './xai-vault.js';
 
 /** Refresh this long before the access token expires. */
 export const XAI_REFRESH_MARGIN_MS = 10 * 60_000;
@@ -50,7 +46,7 @@ export type XaiRefreshOutcome = 'no-credential' | 'fresh' | 'refreshed' | 'vault
 
 export interface XaiRefreshDeps extends Pick<XaiOAuthFetchOptions, 'fetchImpl' | 'now' | 'sleep'> {
   credentialPath?: string;
-  /** Rotate the vault copy. Defaults to `onecli secrets update --id <id> --value <token>`. */
+  /** Rotate the vault copy. Defaults to the OneCLI gateway (`PATCH /v1/secrets/:id`), CLI when no gateway URL is configured. */
   updateSecret?: (secretId: string, value: string) => Promise<void>;
   logger?: Pick<typeof log, 'info' | 'warn' | 'error'>;
 }
@@ -67,19 +63,9 @@ export function isXaiRefreshDue(cred: Pick<XaiOAuthCredential, 'expires' | 'obta
   return now >= xaiRefreshDueAt(cred);
 }
 
-function onecliEnv(): NodeJS.ProcessEnv {
-  // The service unit's PATH rarely carries the CLI's install dirs.
-  const parts = [path.join(os.homedir(), '.local', 'bin'), '/usr/local/bin'];
-  if (process.env.PATH) parts.push(process.env.PATH);
-  return { ...process.env, PATH: parts.join(path.delimiter) };
-}
-
-async function updateOnecliSecret(secretId: string, value: string): Promise<void> {
-  // `value` is a live credential: argv only, never through a shell, never logged.
-  await execFileAsync('onecli', ['secrets', 'update', '--id', secretId, '--value', value], {
-    env: onecliEnv(),
-    maxBuffer: 1024 * 1024,
-  });
+async function updateVaultSecret(secretId: string, value: string): Promise<void> {
+  // `value` is a live credential: JSON body or argv, never a shell string, never logged.
+  await createXaiVaultClient().update(secretId, value);
 }
 
 const lastLoggedAt = new Map<string, number>();
@@ -111,7 +97,7 @@ export async function refreshXaiCredentialIfDue(deps: XaiRefreshDeps = {}): Prom
   const logger = deps.logger ?? log;
   const now = deps.now ?? Date.now;
   const credentialPath = deps.credentialPath ?? xaiCredentialPath();
-  const updateSecret = deps.updateSecret ?? updateOnecliSecret;
+  const updateSecret = deps.updateSecret ?? updateVaultSecret;
 
   let cred: XaiOAuthCredential | null;
   try {

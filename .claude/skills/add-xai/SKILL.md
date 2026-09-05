@@ -27,7 +27,7 @@ test -f src/providers/codex.ts && test -f container/agent-runner/src/providers/c
 
 Check whether the xai payload is already wired (a prior apply, or a trunk that still carries it). All of these present means installed — skip to **Authenticate**:
 
-- `src/providers/xai.ts`, `src/providers/xai-oauth.ts` and `src/providers/xai-oauth-refresh.ts`
+- `src/providers/xai.ts`, `src/providers/xai-oauth.ts`, `src/providers/xai-oauth-refresh.ts` and `src/providers/xai-vault.ts`
 - `container/agent-runner/src/providers/xai.ts`
 - `setup/providers/xai.ts`
 - `import './xai.js';` in `src/providers/index.ts`, `container/agent-runner/src/providers/index.ts`, and `setup/providers/index.ts`
@@ -40,10 +40,12 @@ Fetch the `providers` branch and copy the xai payload into all three trees (addi
 src/providers/xai.ts
 src/providers/xai-oauth.ts
 src/providers/xai-oauth-refresh.ts
+src/providers/xai-vault.ts
 src/providers/xai-registration.test.ts
 src/providers/xai-host-contribution.test.ts
 src/providers/xai-oauth.test.ts
 src/providers/xai-oauth-refresh.test.ts
+src/providers/xai-vault.test.ts
 container/agent-runner/src/providers/xai.ts
 container/agent-runner/src/providers/xai-registration.test.ts
 container/agent-runner/src/providers/xai.config.test.ts
@@ -79,7 +81,7 @@ pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
 ### 4. Validate
 
 ```nc:run effect:test
-pnpm vitest run src/providers/xai-registration.test.ts src/providers/xai-host-contribution.test.ts src/providers/xai-oauth.test.ts src/providers/xai-oauth-refresh.test.ts setup/providers/
+pnpm vitest run src/providers/xai-registration.test.ts src/providers/xai-host-contribution.test.ts src/providers/xai-oauth.test.ts src/providers/xai-oauth-refresh.test.ts src/providers/xai-vault.test.ts setup/providers/
 ```
 ```nc:run effect:test
 cd container/agent-runner && bun test src/providers/xai
@@ -138,7 +140,9 @@ launchctl kickstart -k gui/$(id -u)/com.nanoclaw   # macOS; Linux: systemctl --u
 
 ## How the OAuth session stays alive
 
-The host process starts a refresher with the other host modules (`src/providers/xai-oauth-refresh.ts`). Every minute it re-reads `data/xai-oauth.json`; ten minutes before the access token expires it runs the refresh grant, writes the rotated pair back to the file first (xAI rotates refresh tokens — a consumed one that never reached disk is a dead session), then rotates the vault copy with `onecli secrets update`. A vault push that fails is retried on the next tick without another grant. A grant xAI rejects outright (`invalid_grant`) marks the record `needsRelogin`, logs once every 30 minutes, and waits for a re-run of the sign-in. Nothing is logged but the secret id and expiry — never a token.
+The host process starts a refresher with the other host modules (`src/providers/xai-oauth-refresh.ts`). Every minute it re-reads `data/xai-oauth.json`; ten minutes before the access token expires it runs the refresh grant, writes the rotated pair back to the file first (xAI rotates refresh tokens — a consumed one that never reached disk is a dead session), then rotates the vault copy through the OneCLI gateway API (`PATCH /v1/secrets/:id` at `ONECLI_URL`, the same URL and key the host already uses). The host needs no `onecli` binary at runtime — relevant when the host itself runs in a container; the CLI is used only when no gateway URL is configured. A vault push that fails is retried on the next tick without another grant.
+
+**Host running in Docker:** keep `data/` (credential record, tripwire marker) and `.env` (`XAI_*` lines) on persistent volumes; the host container needs egress to `auth.x.ai` for the refresh grant; run the sign-in step where the checkout, the OneCLI gateway URL and a Docker daemon are reachable, since it also rebuilds the agent image. A grant xAI rejects outright (`invalid_grant`) marks the record `needsRelogin`, logs once every 30 minutes, and waits for a re-run of the sign-in. Nothing is logged but the secret id and expiry — never a token.
 
 Env the host passes into xai containers (all non-secret, read from `.env` at spawn): `XAI_BASE_URL` (default: the Grok proxy), `XAI_DEFAULT_MODEL` (default `grok-4.3`), `XAI_GROK_CLIENT_VERSION` (the `x-grok-client-version` the proxy is told; default `1.0.4`).
 
